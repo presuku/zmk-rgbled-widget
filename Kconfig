@@ -27,6 +27,7 @@ config LED_STRIP
     default y
     
 config WS2812_STRIP
+    bool "WS2812 Strip"
     default y
 
 config RGBLED_WIDGET_LED_COUNT
