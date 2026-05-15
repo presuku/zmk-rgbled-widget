@@ -40,7 +40,7 @@ static int ws2812_set_led(uint8_t led_index, uint8_t color_idx);
 static int ws2812_update_strip(void);
 static void ws2812_clear_strip(void);
 static int set_led_with_sharing(uint8_t led_index, uint8_t color_idx, uint8_t priority, 
-                               bool persistent, uint32_t share_timeout_ms);
+                               bool persistent, uint32_t share_timeout_ms, uint32_t timeout_ms);
 static void return_shared_led(uint8_t led_index);
 static int set_led_pattern(uint8_t led_index, struct animation_state *pattern);
 static void apply_brightness(struct led_rgb *color, uint8_t brightness);
@@ -84,6 +84,8 @@ struct led_state {
     bool is_shared;               // Whether LED is currently shared
     bool is_persistent;           // Whether status should persist
     uint32_t share_end_time;      // When to return to base status
+    uint32_t start_time;          // Start time of led turn-on
+    uint32_t timeout_ms;          // Time until led turn-off
     struct animation_state anim;  // Current animation state
 };
 #endif
@@ -264,14 +266,14 @@ static enum status_priority get_priority_for_status(enum status_type status_type
 }
 
 static int set_status_led(enum status_type status_type, uint8_t color_idx, 
-                         uint16_t duration_ms, bool persistent) {
+                         uint16_t duration_ms, bool persistent, uint32_t timeout_ms) {
     uint8_t primary_led = get_primary_led_for_status(status_type);
     uint8_t priority = get_priority_for_status(status_type, color_idx);
     
     // Try primary LED first
     if (primary_led < CONFIG_RGBLED_WIDGET_LED_COUNT) {
         int ret = set_led_with_sharing(primary_led, color_idx, priority, 
-                                      persistent, duration_ms);
+                                      persistent, duration_ms, timeout_ms);
         if (ret == 0) {
             led_states[primary_led].status_type = status_type;
             LOG_DBG("Set status %d on primary LED %d", status_type, primary_led);
@@ -283,7 +285,7 @@ static int set_status_led(enum status_type status_type, uint8_t color_idx,
     uint8_t fallback_led = get_fallback_led_for_status(status_type);
     if (fallback_led < CONFIG_RGBLED_WIDGET_LED_COUNT) {
         int ret = set_led_with_sharing(fallback_led, color_idx, priority, 
-                                      false, CONFIG_RGBLED_WIDGET_SHARE_TIMEOUT_MS);
+                                      false, CONFIG_RGBLED_WIDGET_SHARE_TIMEOUT_MS, timeout_ms);
         if (ret == 0) {
             led_states[fallback_led].status_type = status_type;
             LOG_DBG("Set status %d on fallback LED %d (shared)", status_type, fallback_led);
@@ -302,13 +304,23 @@ int ws2812_clear_status_led(enum status_type status_type) {
             if (led_states[i].is_shared) {
                 return_shared_led(i);
             } else {
-                ws2812_set_led(i, 0); // Turn off
-                led_states[i].status_type = STATUS_CUSTOM;
-                led_states[i].priority = PRIORITY_AMBIENT;
+                ws2812_clear_led(i); // Turn off
             }
         }
     }
     return 0;
+}
+
+static void clear_timeouted_led(void) {
+    uint32_t current_time = k_uptime_get_32();
+
+    // Find timeouted LEDs
+    for (int i = 0; i < CONFIG_RGBLED_WIDGET_LED_COUNT; i++) {
+        if (led_states[i].is_persistent == false
+        && (led_states[i].start_time + led_states[i].timeout_ms < current_time)) {
+            ws2812_clear_led(i); // Turn off
+        }
+    }
 }
 
 // Pattern Engine Functions
@@ -449,10 +461,11 @@ static void update_all_animations(void) {
 }
 
 // Enhanced status indication with patterns
-static int indicate_battery_enhanced(void) {
+static int indicate_battery_enhanced(bool keypress) {
     uint8_t battery_level = zmk_battery_state_of_charge();
     uint8_t color_idx = 0;
     struct animation_state pattern = {0};
+    uint32_t timeout_ms = 4000;
     
     if (battery_level == 0) {
         color_idx = CONFIG_RGBLED_WIDGET_BATTERY_COLOR_MISSING;
@@ -482,7 +495,7 @@ static int indicate_battery_enhanced(void) {
     LOG_INF("Enhanced battery indication: level %d%%, color %s, pattern %d", 
             battery_level, color_names[color_idx], pattern.type);
     
-    int ret = set_status_led(STATUS_BATTERY, color_idx, 0, true);
+    int ret = set_status_led(STATUS_BATTERY, color_idx, 0, !keypress, timeout_ms);
     
     // Apply pattern if using spatial mapping
     uint8_t battery_led = get_primary_led_for_status(STATUS_BATTERY);
@@ -493,21 +506,26 @@ static int indicate_battery_enhanced(void) {
     return ret;
 }
 
-static int indicate_connectivity_ws2812(void) {
+static int indicate_connectivity_enhanced(bool keypress) {
     uint8_t color_idx = 0;
     struct animation_state pattern = {0};
+    uint32_t timeout_ms = 4000;
+    bool persistent = false;
     pattern.type = ANIM_STATIC;
     
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
     switch (zmk_endpoint_get_selected().transport) {
     case ZMK_TRANSPORT_USB:
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_CONN_SHOW_USB)
+        ws2812_clear_status_led(STATUS_CONNECTIVITY);
         color_idx = CONFIG_RGBLED_WIDGET_CONN_COLOR_USB;
+        persistent = true;
         LOG_INF("Enhanced USB connection indication");
         break;
 #endif
     default: // ZMK_TRANSPORT_BLE
 #if IS_ENABLED(CONFIG_ZMK_BLE)
+        ws2812_clear_status_led(STATUS_CONNECTIVITY);
         if (zmk_ble_active_profile_is_connected()) {
             color_idx = CONFIG_RGBLED_WIDGET_CONN_COLOR_CONNECTED;
             LOG_INF("BLE connected indication");
@@ -516,6 +534,7 @@ static int indicate_connectivity_ws2812(void) {
             pattern.type = ANIM_PULSE;
             pattern.period_ms = 2000;
             pattern.start_color = color_idx;
+            persistent = !keypress;
             LOG_INF("BLE advertising indication");
         } else {
             color_idx = CONFIG_RGBLED_WIDGET_CONN_COLOR_DISCONNECTED;
@@ -523,6 +542,7 @@ static int indicate_connectivity_ws2812(void) {
             pattern.period_ms = 1000;
             pattern.start_color = color_idx;
             pattern.end_color = 0;
+            timeout_ms = 1000 * 60;
             LOG_INF("BLE disconnected indication");
         }
 #endif
@@ -538,11 +558,12 @@ static int indicate_connectivity_ws2812(void) {
         pattern.period_ms = 1000;
         pattern.start_color = color_idx;
         pattern.end_color = 0;
+        timeout_ms = 1000 * 60;
         LOG_INF("Enhanced peripheral disconnected indication");
     }
 #endif
     
-    int ret = set_status_led(STATUS_CONNECTIVITY, color_idx, 0, true);
+    int ret = set_status_led(STATUS_CONNECTIVITY, color_idx, 0, persistent, timeout_ms);
     
     // Apply pattern if using spatial mapping
     uint8_t conn_led = get_primary_led_for_status(STATUS_CONNECTIVITY);
@@ -578,7 +599,7 @@ static int indicate_layer_enhanced(bool use_shared) {
     // Use shared timeout for layer indication
     uint32_t timeout_ms = use_shared ? CONFIG_RGBLED_WIDGET_SHARE_TIMEOUT_MS : 0;
     
-    int ret = set_status_led(STATUS_LAYER, color_idx, timeout_ms, !use_shared);
+    int ret = set_status_led(STATUS_LAYER, color_idx, timeout_ms, !use_shared, 1000);
     
     // Apply pattern for layer transitions
     if (ret == 0 && pattern.type != ANIM_STATIC) {
@@ -702,6 +723,9 @@ int ws2812_clear_led(uint8_t led_index) {
     led_states[led_index].is_shared = false;
     led_states[led_index].is_persistent = false;
     led_states[led_index].share_end_time = 0;
+    led_states[led_index].start_time = 0;
+    led_states[led_index].timeout_ms = 0;
+    led_states[led_index].anim = (struct animation_state){0};
     
     return led_strip_update_rgb(ws2812_dev, led_colors, CONFIG_RGBLED_WIDGET_LED_COUNT);
 }
@@ -714,21 +738,16 @@ static void ws2812_clear_strip(void) {
     for (int i = 0; i < CONFIG_RGBLED_WIDGET_LED_COUNT; i++) {
         led_colors[i] = (struct led_rgb){0, 0, 0};
         led_states[i].current_color = 0;
-    }
-    ws2812_update_strip();
-}
-
-int ws2812_clear_all(void) {
-    ws2812_clear_strip();
-    // Reset all LED states
-    for (int i = 0; i < CONFIG_RGBLED_WIDGET_LED_COUNT; i++) {
         led_states[i].status_type = STATUS_CUSTOM;
         led_states[i].priority = PRIORITY_AMBIENT;
         led_states[i].is_shared = false;
         led_states[i].is_persistent = false;
         led_states[i].share_end_time = 0;
+        led_states[i].start_time = 0;
+        led_states[i].timeout_ms = 0;
+        led_states[i].anim = (struct animation_state){0};
     }
-    return 0;
+    ws2812_update_strip();
 }
 
 // LED Sharing Management
@@ -761,7 +780,7 @@ static bool can_share_led(uint8_t led_index, uint8_t new_priority) {
 }
 
 static int set_led_with_sharing(uint8_t led_index, uint8_t color_idx, uint8_t priority, 
-                               bool persistent, uint32_t share_timeout_ms) {
+                               bool persistent, uint32_t share_timeout_ms, uint32_t timeout_ms) {
     if (led_index >= CONFIG_RGBLED_WIDGET_LED_COUNT) {
         return -EINVAL;
     }
@@ -784,11 +803,14 @@ static int set_led_with_sharing(uint8_t led_index, uint8_t color_idx, uint8_t pr
     state->priority = priority;
     state->is_shared = (share_timeout_ms > 0);
     state->is_persistent = persistent;
+    state->start_time = k_uptime_get_32();
+    state->timeout_ms = timeout_ms;
+    
     
     if (share_timeout_ms > 0) {
-        state->share_end_time = k_uptime_get_32() + share_timeout_ms;
+        state->share_end_time = state->start_time  + share_timeout_ms;
     }
-    
+
     // Set the LED color
     ws2812_set_led(led_index, color_idx);
     
@@ -803,15 +825,15 @@ static void return_shared_led(uint8_t led_index) {
     if (led_index >= CONFIG_RGBLED_WIDGET_LED_COUNT) {
         return;
     }
-    
+
     struct led_state *state = &led_states[led_index];
-    
+
     if (state->is_shared) {
         ws2812_set_led(led_index, state->base_color);
         state->is_shared = false;
         state->priority = PRIORITY_AMBIENT;
         state->share_end_time = 0;
-        
+
         LOG_DBG("Returned shared LED %d to base color %d", led_index, state->base_color);
     }
 }
@@ -830,6 +852,7 @@ static void check_shared_led_timeouts(void) {
     }
 }
 
+#if !IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
 // Enhanced set_rgb_leds function with multi-LED support
 static void set_rgb_leds(uint8_t color, uint16_t duration_ms) {
     // For backward compatibility, set all LEDs to the same color when using simple interface
@@ -841,19 +864,20 @@ static void set_rgb_leds(uint8_t color, uint16_t duration_ms) {
     }
     led_current_color = color;
 }
+#endif // !IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
 
 int ws2812_set_status_led(enum status_type status_type, uint8_t color_idx, 
-                         uint16_t duration_ms, bool persistent) {
-    return set_status_led(status_type, color_idx, duration_ms, persistent);
+                         uint16_t duration_ms, bool persistent, uint32_t timeout_ms) {
+    return set_status_led(status_type, color_idx, duration_ms, persistent, timeout_ms);
 }
 
 // Public API wrappers for enhanced indication functions
 int ws2812_indicate_battery_enhanced(void) {
-    return indicate_battery_enhanced();
+    return indicate_battery_enhanced(true);
 }
 
 int ws2812_indicate_connectivity_enhanced(void) {
-    return indicate_connectivity_ws2812();
+    return indicate_connectivity_enhanced(true);
 }
 
 int ws2812_indicate_layer_enhanced(bool use_shared) {
@@ -901,14 +925,16 @@ static void set_rgb_leds(uint8_t color, uint16_t duration_ms) {
 }
 #endif
 
+#if !IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
 // define message queue of blink work items, that will be processed by a
 // separate thread
 K_MSGQ_DEFINE(led_msgq, sizeof(struct blink_item), 16, 1);
+#endif
 
-static void indicate_connectivity_internal(void) {
+static void indicate_connectivity_internal(bool keypress) {
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
     // Use enhanced connectivity indication for WS2812
-    indicate_connectivity_ws2812();
+    indicate_connectivity_enhanced(keypress);
     return;
 #else
     // Original implementation for GPIO LEDs and simple WS2812
@@ -960,16 +986,52 @@ static void indicate_connectivity_internal(void) {
 }
 
 static int led_output_listener_cb(const zmk_event_t *eh) {
-    if (initialized) {
-        indicate_connectivity();
+
+    if (!initialized) {
+        return 0;
     }
-    return 0;
+#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_CONN_SHOW_USB)
+    struct zmk_endpoint_changed *ev_ec = as_zmk_endpoint_changed(eh);
+    if (ev_ec != NULL) {
+        indicate_connectivity_internal(false);
+    }
+#endif
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+    struct zmk_ble_active_profile_changed *ev_bapc = as_zmk_ble_active_profile_changed(eh);
+    if (ev_bapc != NULL) {
+        indicate_connectivity_internal(false);
+    }
+#endif
+#elif IS_ENABLED(CONFIG_ZMK_SPLIT_BLE)
+    struct zmk_split_peripheral_status_changed *ev_spsch = as_zmk_split_peripheral_status_changed(eh);
+    if (ev_spsch != NULL) {
+        indicate_connectivity_internal(false);
+    }
+#endif
+    // check if this is indeed an activity state changed event
+    struct zmk_activity_state_changed *ev_asc = as_zmk_activity_state_changed(eh);
+    if (ev_asc != NULL) {
+        switch (ev_asc->state) {
+        case ZMK_ACTIVITY_SLEEP:
+            LOG_INF("Detected sleep activity state, turn off LED");
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+            ws2812_clear_strip();
+#else
+            set_rgb_leds(0, 0);
+#endif
+            break;
+        default: // not handling IDLE and ACTIVE yet
+            break;
+        }
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    return ZMK_EV_EVENT_BUBBLE;
 }
 
 // debouncing to ignore all but last connectivity event, to prevent repeat blinks
-static struct k_work_delayable indicate_connectivity_work;
-static void indicate_connectivity_cb(struct k_work *work) { indicate_connectivity_internal(); }
-void indicate_connectivity() { k_work_reschedule(&indicate_connectivity_work, K_MSEC(16)); }
+void indicate_connectivity(void) { indicate_connectivity_internal(true); }
 
 ZMK_LISTENER(led_output_listener, led_output_listener_cb);
 
@@ -985,6 +1047,7 @@ ZMK_SUBSCRIPTION(led_output_listener, zmk_ble_active_profile_changed);
 // run led_output_listener_cb on peripheral status change event
 ZMK_SUBSCRIPTION(led_output_listener, zmk_split_peripheral_status_changed);
 #endif
+ZMK_SUBSCRIPTION(led_output_listener, zmk_activity_state_changed);
 
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
 static inline uint8_t get_battery_color(uint8_t battery_level) {
@@ -1005,15 +1068,16 @@ static inline uint8_t get_battery_color(uint8_t battery_level) {
     return CONFIG_RGBLED_WIDGET_BATTERY_COLOR_LOW;
 }
 
-void indicate_battery(void) {
+static void indicate_battery_internal(bool keypress) {
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
     // Use enhanced battery indication for WS2812
-    indicate_battery_enhanced();
+    indicate_battery_enhanced(keypress);
     return;
 #else
     // Original implementation for GPIO LEDs and simple WS2812
     struct blink_item blink = {.duration_ms = CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS};
     int retry = 0;
+    ARG_UNUSED(keypress);
 
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_BATTERY_SHOW_SELF) ||                                          \
     IS_ENABLED(CONFIG_RGBLED_WIDGET_BATTERY_SHOW_PERIPHERALS)
@@ -1052,6 +1116,10 @@ void indicate_battery(void) {
 #endif // Enhanced vs original
 }
 
+void indicate_battery(void) {
+    indicate_battery_internal(true);
+}
+
 static int led_battery_listener_cb(const zmk_event_t *eh) {
     if (!initialized) {
         return 0;
@@ -1063,11 +1131,15 @@ static int led_battery_listener_cb(const zmk_event_t *eh) {
     if (battery_level > 0 && battery_level <= CONFIG_RGBLED_WIDGET_BATTERY_LEVEL_CRITICAL) {
         LOG_BATTERY(battery_level, CRITICAL);
 
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+        indicate_battery_internal(false);
+#else
         struct blink_item blink = {.duration_ms = CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS,
                                    .color = CONFIG_RGBLED_WIDGET_BATTERY_COLOR_CRITICAL};
         LOG_DBG("send a battery blink item from msgq, color %d, duration %d, bat level %d", blink.color,
                     blink.duration_ms, battery_level);
         k_msgq_put(&led_msgq, &blink, K_NO_WAIT);
+#endif
     }
     return 0;
 }
@@ -1099,32 +1171,16 @@ void update_layer_color(void) {
 }
 
 static int led_layer_color_listener_cb(const zmk_event_t *eh) {
-    struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
-
-    // check if this is indeed an activity state changed event
-    if (ev != NULL) {
-        switch (ev->state) {
-        case ZMK_ACTIVITY_SLEEP:
-            LOG_INF("Detected sleep activity state, turn off LED");
-            set_rgb_leds(0, 0);
-            break;
-        default: // not handling IDLE and ACTIVE yet
-            break;
-        }
-        return 0;
-    }
-
     // it must be a layer change event instead
     if (initialized) {
         update_layer_color();
     }
-    return 0;
+    return ZMK_EV_EVENT_BUBBLE;
 }
 
 // run layer_color_listener_cb on layer status change event and activity state event
 ZMK_LISTENER(led_layer_color_listener, led_layer_color_listener_cb);
 ZMK_SUBSCRIPTION(led_layer_color_listener, zmk_layer_state_changed);
-ZMK_SUBSCRIPTION(led_layer_color_listener, zmk_activity_state_changed);
 #endif // SHOW_LAYER_COLORS
 
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
@@ -1163,7 +1219,7 @@ static int led_layer_listener_cb(const zmk_event_t *eh) {
     if (initialized && as_zmk_layer_state_changed(eh)->state) {
         k_work_reschedule(&layer_indicate_work, K_MSEC(CONFIG_RGBLED_WIDGET_LAYER_DEBOUNCE_MS));
     }
-    return 0;
+    return ZMK_EV_EVENT_BUBBLE;
 }
 
 static void indicate_layer_cb(struct k_work *work) { indicate_layer(); }
@@ -1177,18 +1233,14 @@ extern void led_process_thread(void *d0, void *d1, void *d2) {
     ARG_UNUSED(d1);
     ARG_UNUSED(d2);
 
-    k_work_init_delayable(&indicate_connectivity_work, indicate_connectivity_cb);
-
 #if SHOW_LAYER_CHANGE
     k_work_init_delayable(&layer_indicate_work, indicate_layer_cb);
 #endif
 
     while (true) {
-        // wait until a blink item is received and process it
-        struct blink_item blink = {-1, -1, -1};
-        int result_code = k_msgq_get(&led_msgq, &blink, K_MSEC(100)); // Non-blocking with timeout for animations
-
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+        k_sleep(K_MSEC(100));
+
         // Check for expired shared LED timeouts
         check_shared_led_timeouts();
         
@@ -1196,7 +1248,12 @@ extern void led_process_thread(void *d0, void *d1, void *d2) {
 #   if IS_ENABLED(CONFIG_RGBLED_WIDGET_ANIMATIONS)
         update_all_animations();
 #   endif
-#endif
+        clear_timeouted_led();
+#else
+        // wait until a blink item is received and process it
+        struct blink_item blink = {-1, -1, -1};
+        int result_code = k_msgq_get(&led_msgq, &blink, K_MSEC(100)); // Non-blocking with timeout for animations
+
         if (result_code != ENOMSG) {
             if (blink.duration_ms > 0) {
                 LOG_DBG("Got a blink item from msgq, color %d, duration %d", blink.color,
@@ -1225,6 +1282,7 @@ extern void led_process_thread(void *d0, void *d1, void *d2) {
             }
             // timeout
         }
+#endif
     }
 }
 
@@ -1247,15 +1305,14 @@ extern void led_init_thread(void *d0, void *d1, void *d2) {
     // check and indicate battery level on thread start
     LOG_INF("Indicating initial battery status");
 
-    indicate_battery();
-
     // wait until blink should be displayed for further checks
-    k_sleep(K_MSEC(CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS + CONFIG_RGBLED_WIDGET_INTERVAL_MS));
+    k_sleep(K_MSEC(2500));
+    indicate_battery_internal(true);
 #endif // IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
 
     // check and indicate current profile or peripheral connectivity status
     LOG_INF("Indicating initial connectivity status");
-    indicate_connectivity();
+    indicate_connectivity_internal(false);
 
 #if SHOW_LAYER_COLORS
     LOG_INF("Setting initial layer color");

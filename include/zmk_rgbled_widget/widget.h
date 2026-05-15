@@ -65,7 +65,7 @@ int ws2812_clear_all(void);
 
 // Status indication functions with LED assignment
 int ws2812_set_status_led(enum status_type status_type, uint8_t color_idx, 
-                         uint16_t duration_ms, bool persistent);
+                         uint16_t duration_ms, bool persistent, uint32_t timeout_ms);
 int ws2812_clear_status_led(enum status_type status_type);
 
 // LED sharing functions
