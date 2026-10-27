@@ -1619,6 +1619,7 @@ static int led_activity_listener_cb(const zmk_event_t *eh) {
     case ZMK_ACTIVITY_ACTIVE:
         LOG_INF("Activity ACTIVE, restoring LED state");
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+#if 0
         // Restore layer color and refresh status indicators
 #if SHOW_LAYER_COLORS
         update_layer_color();
@@ -1626,6 +1627,7 @@ static int led_activity_listener_cb(const zmk_event_t *eh) {
         indicate_connectivity();
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
         indicate_battery();
+#endif
 #endif
 #else
         set_rgb_leds(led_layer_color, 0);
